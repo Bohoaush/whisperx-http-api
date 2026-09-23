@@ -1,4 +1,9 @@
 import os
+
+# Ask the caching allocator to grow segments instead of fragmenting the 16 GB
+# card. Must be set before the first CUDA allocation. Does not unload models.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import uuid
 import threading
 import queue
@@ -13,6 +18,8 @@ import torch
 import whisperx
 import traceback
 import gc
+
+from qwen_check import correct_transcript_segments
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -150,12 +157,30 @@ def _write_vtt(result: dict, out_path: str) -> None:
         f.write(content)
 
 
+def _whisper_batch_size() -> int:
+    raw = os.environ.get("WHISPER_BATCH_SIZE", "4").strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"WHISPER_BATCH_SIZE must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise RuntimeError(f"WHISPER_BATCH_SIZE must be positive, got {value}")
+    return value
+
+
 def get_whisperx_models():
     global _model, _align_model, _metadata, _diarize_model
     with _model_lock:
         if _model is None:
             print("Loading WhisperX model on", DEVICE, flush=True)
-            _model = whisperx.load_model(MODEL_NAME, DEVICE, language=LANGUAGE_CODE)
+            # float16 keeps large-v3 near 3 GB so a 4-bit Qwen can stay resident
+            # with it on a 16 GB RTX PRO 2000 Blackwell. Never unloaded.
+            load_kwargs = {}
+            if DEVICE == "cuda":
+                load_kwargs["compute_type"] = "float16"
+            _model = whisperx.load_model(
+                MODEL_NAME, DEVICE, language=LANGUAGE_CODE, **load_kwargs
+            )
 
             _align_model, _metadata = whisperx.load_align_model(
                 language_code=LANGUAGE_CODE, device=DEVICE
@@ -190,8 +215,11 @@ def transcribe_job(job_id: str):
         audio = whisperx.load_audio(audio_path)
 
         print(f"[job {job_id}] Audio loaded, running ASR...", flush=True)
-        # Force Czech ASR language
-        result = model.transcribe(audio, batch_size=4, language=LANGUAGE_CODE)
+        # Force Czech ASR language. Batch size 4 is the 16 GB budget with Qwen
+        # kept loaded beside Whisper; lower WHISPER_BATCH_SIZE if a job OOMs.
+        result = model.transcribe(
+            audio, batch_size=_whisper_batch_size(), language=LANGUAGE_CODE
+        )
         print(
             f"[job {job_id}] ASR finished, {len(result.get('segments', []))} segments.",
             flush=True,
@@ -218,6 +246,18 @@ def transcribe_job(job_id: str):
             except Exception as e:
                 print(f"[job {job_id}] Diarization failed: {e}", flush=True)
                 traceback.print_exc()
+
+        # Drop known junk before Qwen, then proofread every remaining line.
+        # Qwen is loaded once and does not evict the WhisperX models.
+        result["segments"] = _filter_hallucinated_segments(result.get("segments", []))
+        print(
+            f"[job {job_id}] {len(result['segments'])} segments after hallucination filter. "
+            "Running Qwen proofreading.",
+            flush=True,
+        )
+        result["segments"] = correct_transcript_segments(
+            result["segments"], log_prefix=f"[job {job_id}] "
+        )
 
         # Write VTT file into OUTPUT_DIR, reusing original basename
         base_name = os.path.splitext(os.path.basename(audio_path))[0]

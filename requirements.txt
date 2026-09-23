@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+whisperx
+torch
+transformers>=4.51
+accelerate>=1.0
+bitsandbytes>=0.45.3
