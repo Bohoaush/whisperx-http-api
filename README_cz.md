@@ -35,6 +35,24 @@ Při spuštění se:
 - načtou ASR a alignment modely (defaultně Czech `large-v3`).
 - spustí worker který si bere požadavky z fronty.
 
+### Výběr ASR enginu
+
+Před spuštěním nastavte `ASR_ENGINE`:
+
+| `ASR_ENGINE` | Model | Instalace navíc |
+|---|---|---|
+| `whisperx` (výchozí) | WhisperX s `WHISPER_MODEL` (výchozí `large-v3`) | – |
+| `whisper-cz` | WhisperX s českým komunitním fine-tunem [`mikr/whisper-large-v3-czech-cv13`](https://huggingface.co/mikr/whisper-large-v3-czech-cv13) | `pip install transformers ctranslate2` (pro jednorázovou konverzi) |
+| `canary` | NVIDIA [Canary-1B-v2](https://huggingface.co/nvidia/canary-1b-v2) (CC-BY-4.0), na FLEURS má v češtině nižší WER než Whisper large-v3 | `pip install -U "nemo_toolkit[asr]"`, GPU NVIDIA Ampere nebo novější |
+
+```bash
+ASR_ENGINE=canary uvicorn app:app --host 0.0.0.0 --port 8093
+```
+
+- **whisper-cz**: při prvním spuštění se model převede do formátu CTranslate2 do `models/whisper-large-v3-czech-cv13-ct2` (`WHISPER_CZ_CT2_DIR`) a dál se načítá odtud. Alignment WhisperX, úvodní prompt i vlastní pravidla fungují stejně jako u `whisperx`.
+- **canary**: audio se rozřeže na 20–30 s úseky v nejtišším místě, přepíše se po dávkách (`CANARY_BATCH_SIZE`, výchozí 8) s vlastními časy slov z Canary a seskupí do titulků (konec věty, max. 7 s, 84 znaků nebo pauza 1 s). Alignment WhisperX se nepoužívá a úvodní prompt neplatí (Canary prompt nemá), vlastní pravidla a filtry ano. Diarizace běží, jen pokud je ve stejném prostředí nainstalovaný WhisperX.
+- Pro porovnání enginů na stejných souborech spusťte každý s vlastním `OUTPUT_DIR` (výchozí `transcripts`).
+
 ---
 
 ## API
@@ -46,12 +64,14 @@ Při spuštění se:
 ```json
 {
   "source_path": "/absolute/path/to/media/file.mp4",
-  "priority": "standard"
+  "priority": "standard",
+  "language": "cs"
 }
 ```
 
 - `source_path` je **absolutní cesta** k existujícímu audio/video souboru.
 - `priority` je `"standard"` - stadardní (výchozí) nebo `"high"` - vysoká.
+- `language` (nepovinné) je jazyk mluveného slova jako kód ISO 639-1 (`"cs"`, `"sk"`, `"en"`…). Výchozí je `"cs"`. Kód, který zvolený engine nepodporuje, vrátí 400. Vlastní pravidla se použijí jen pro jazyky uvedené v souboru pravidel (viz níže); pro ostatní jazyky se použije alignment model WhisperX pro daný jazyk, pokud existuje.
 
 Odpověď:
 
@@ -59,7 +79,8 @@ Odpověď:
 {
   "id": "job-uuid",
   "status": "queued",
-  "priority": "standard"
+  "priority": "standard",
+  "language": "cs"
 }
 ```
 
@@ -76,6 +97,7 @@ Příklad odpovědi:
   "id": "job-uuid",
   "source_path": "/absolute/path/to/media/file.mp4",
   "priority": "standard",
+  "language": "cs",
   "status": "finished",
   "error": null,
   "output_path": "transcripts/file.vtt"
@@ -109,17 +131,26 @@ Vrací pole se všemi stavy požadavků ve stejném formátu jako `GET /jobs/{jo
 
 ---
 
-## Filtrování halucinací
+## Filtrování halucinací a vlastní pravidla
 
-Před zápisem VTT, `_filter_hallucinated_segments` v `app.py` se vymažou:
+Před zápisem VTT `app.py` vždy:
 
-- prázdné segmenty.
-- definované známé halucinace, např.:
-  - Segmenty začínající `Titulky vytvořil...`
-  - Některé URL, např. `www.hradeckralove.org`, `www.arkance-systems.cz`
-  - Některé řetězce jako `Konec...`.
+- vymaže prázdné segmenty a samostatné titulky `...` / `…`,
+- vymaže velmi krátké titulky s nereálně dlouhým textem,
+- zkrátí smyčky opakování (stejný titulek 3× a víckrát za sebou zůstane jednou, slovo opakované 4× a víckrát v jednom titulku zůstane jednou).
 
-Filtrování je možné přenastavit editováním pravidel v `_filter_hallucinated_segments`.
+Pravidla pro konkrétní obsah jsou v samostatném Python souboru, výchozí je `custom_rules.py` vedle `app.py` (jinou cestu lze nastavit proměnnou `CUSTOM_RULES`). Git ho ignoruje, takže vlastní slovník a opravy zůstanou soukromé. Začněte z přiloženého příkladu:
+
+```bash
+cp custom_rules.example.py custom_rules.py
+```
+
+Pokud `custom_rules.py` neexistuje, použije se `custom_rules.example.py`. Soubor definuje:
+
+- `LANGUAGES`: jazyky úloh, na které se pravidla použijí (např. `{"cs"}`). Ostatní úlohy dostanou jen vestavěné filtry výše.
+- `INITIAL_PROMPT`: text předaný Whisperu jako úvodní prompt. Whisper z něj přebírá slovní zásobu, pravopis a velká písmena, proto ho pište v domácím stylu se jmény a výrazy typickými pro vaše pořady. Musí být krátký: vejde se jen asi 220 tokenů. Proměnná `WHISPER_INITIAL_PROMPT` ho přepíše (prázdný řetězec ho vypne). Canary ho ignoruje.
+- `BLACKLIST` / `DROP_PREFIXES`: titulky, které tyto fráze obsahují / jimi začínají, se vymažou. Příklad obsahuje běžné české halucinace Whisperu jako `Titulky vytvořil...`, některé URL a řetězce `Konec...`.
+- `REPLACEMENTS`: dvojice `(regex, náhrada)` použité na každý titulek, např. `aby jsme` → `abychom`. Náhrada může být funkce, jako v `re.sub`. Přidávejte jen opravy, které jsou špatně v jakémkoli kontextu.
 
 ---
 

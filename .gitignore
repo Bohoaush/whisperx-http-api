@@ -1,0 +1,4 @@
+custom_rules.py
+__pycache__/
+models/
+transcripts/
