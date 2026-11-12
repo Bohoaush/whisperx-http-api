@@ -453,7 +453,13 @@ def transcribe_job(job_id: str):
                 model, INITIAL_PROMPT if language in RULES.languages else None
             )
             # ASR language forced to the job's language
-            result = model.transcribe(audio, batch_size=4, language=language)
+            # task must be passed explicitly: when the language differs from the one
+            # the model was loaded with, WhisperX rebuilds its tokenizer and would
+            # otherwise reuse tokenizer.task, which is a token id (e.g. 50360), not
+            # the string "transcribe" -> "'50360' is not a valid task".
+            result = model.transcribe(
+                audio, batch_size=4, language=language, task="transcribe"
+            )
             align_model, metadata = get_align_model(language)
         print(
             f"[job {job_id}] ASR finished, {len(result.get('segments', []))} segments.",
